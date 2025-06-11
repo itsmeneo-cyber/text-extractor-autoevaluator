@@ -1,0 +1,4 @@
+.env
+*.json
+ocr_debug.log
+__pycache__/
