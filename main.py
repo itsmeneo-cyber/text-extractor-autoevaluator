@@ -7,6 +7,8 @@ from fastapi.middleware.cors import CORSMiddleware  # <-- Added
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
 import io
+import tempfile
+import json
 # ----------------------------
 # Load Environment Variables
 # ----------------------------
@@ -50,20 +52,30 @@ def preprocess_image(content: bytes) -> bytes:
 # Function to Extract Text from Image
 # ----------------------------
 
-
 def extract_text_from_image(image_file):
     logging.info("Starting text extraction process.")
 
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
+
     if not credentials_path:
         logging.error("Environment variable 'GOOGLE_APPLICATION_CREDENTIALS' is not set.")
         raise HTTPException(status_code=500, detail="Google credentials are not set.")
 
+    # If file doesn't exist (Render), treat it as embedded JSON instead of file path
     if not os.path.exists(credentials_path):
-        logging.error(f"Credential file does not exist at: {credentials_path}")
-        raise HTTPException(status_code=500, detail="Credential file not found.")
+        logging.warning(f"Credential file '{credentials_path}' not found. Trying to interpret as embedded JSON.")
 
-    logging.info(f"Using credentials from: {credentials_path}")
+        try:
+            creds_data = json.loads(credentials_path)
+            with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as temp:
+                json.dump(creds_data, temp)
+                os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp.name
+                logging.info("Temp credential file created from inline JSON.")
+        except Exception as e:
+            logging.exception("Failed to handle GOOGLE_APPLICATION_CREDENTIALS as embedded JSON.")
+            raise HTTPException(status_code=500, detail="Invalid credential format in environment variable.")
+    else:
+        logging.info(f"Using credential file: {credentials_path}")
 
     # Initialize Vision API client
     try:
@@ -105,7 +117,6 @@ def extract_text_from_image(image_file):
     else:
         logging.warning("No text was found in the image.")
         return "No text found."
-
 #Health Check
 @app.get("/health")
 async def health_check():
