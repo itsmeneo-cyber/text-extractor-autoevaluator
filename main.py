@@ -63,7 +63,7 @@ def extract_text_from_image(image_file):
 
     # If file doesn't exist (Render), treat it as embedded JSON instead of file path
     if not os.path.exists(credentials_path):
-        logging.warning(f"Credential file '{credentials_path}' not found. Trying to interpret as embedded JSON.")
+        logging.info("GOOGLE_APPLICATION_CREDENTIALS looks like JSON. Trying to interpret as embedded credentials.")
 
         try:
             creds_data = json.loads(credentials_path)
