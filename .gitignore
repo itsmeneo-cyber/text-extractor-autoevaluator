@@ -1,4 +1,24 @@
+# Python artifacts
+__pycache__/
+*.py[cod]
+*.log
+
+# Virtual environment
+venv/
 .env
+
+# VSCode / PyCharm
+.vscode/
+.idea/
+
+# OS-specific files
+.DS_Store
+
+# Credentials and debug
 *.json
 ocr_debug.log
-__pycache__/
+
+# Cache and build
+*.egg-info/
+dist/
+build/

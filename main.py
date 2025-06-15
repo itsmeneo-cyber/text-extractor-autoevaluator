@@ -1,143 +1,155 @@
 import logging
 import os
-from google.cloud import vision
 import io
-from fastapi import FastAPI, HTTPException, UploadFile, File
-from fastapi.middleware.cors import CORSMiddleware  # <-- Added
+import json
+import tempfile
 from dotenv import load_dotenv
 from PIL import Image, ImageEnhance
-import io
-import tempfile
-import json
-# ----------------------------
-# Load Environment Variables
-# ----------------------------
+from google.cloud import vision
+from fastapi import FastAPI, HTTPException, UploadFile, File
+from fastapi.middleware.cors import CORSMiddleware
+from pdf2image import convert_from_bytes
+import httpx
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+
+# Load env variables
 load_dotenv()
+GROQ_API_KEY = os.getenv("GROQ_API_KEY")
+MODEL_NAME = os.getenv("MODEL_NAME", "llama3-70b-8192")
+BACKEND_URL = os.getenv("BACKEND_URL", "http://localhost:8080")
 
-# ----------------------------
-# Logging Setup
-# ----------------------------
-logging.basicConfig(
-    level=logging.DEBUG,
-    format='%(asctime)s - %(levelname)s - %(message)s',
-    handlers=[
-        logging.FileHandler("ocr_debug.log"),
-        logging.StreamHandler()
-    ]
-)
-
-# FastAPI instance
+# Setup
 app = FastAPI()
-FRONTEND_URL = os.getenv("FRONTEND_URL", "http://localhost:8082")
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[FRONTEND_URL],
+    allow_origins=[BACKEND_URL],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
+logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
+executor = ThreadPoolExecutor(max_workers=2)
 
-def preprocess_image(content: bytes) -> bytes:
+def preprocess_image(img_bytes: bytes) -> bytes:
     try:
-        img = Image.open(io.BytesIO(content)).convert('L')
-        enhancer = ImageEnhance.Contrast(img)
-        img = enhancer.enhance(2.0)
+        img = Image.open(io.BytesIO(img_bytes)).convert("L")
+        base_width = 1200
+        w_percent = base_width / float(img.size[0])
+        h_size = int(float(img.size[1]) * float(w_percent))
+        img = img.resize((base_width, h_size), Image.LANCZOS)
+        img = ImageEnhance.Contrast(img).enhance(2.5)
         output = io.BytesIO()
         img.save(output, format="PNG")
         return output.getvalue()
-    except Exception as e:
-        logging.warning("Preprocessing failed. Using original image.")
-        return content
-# ----------------------------
-# Function to Extract Text from Image
-# ----------------------------
+    except Exception:
+        logging.warning("Preprocessing failed, using original image.")
+        return img_bytes
 
-def extract_text_from_image(image_file):
-    logging.info("Starting text extraction process.")
+async def groq_spellcheck(raw_text: str) -> str:
+    prompt = f"""
+You are a spelling correction assistant.
 
+Please only correct spelling mistakes in the following text. Do NOT change any grammar, phrasing, or meaning. Return the corrected text only.
+
+Text:
+\"\"\"{raw_text}\"\"\"
+"""
+    headers = {
+        "Authorization": f"Bearer {GROQ_API_KEY}",
+        "Content-Type": "application/json",
+    }
+    payload = {
+        "model": MODEL_NAME,
+        "messages": [{"role": "user", "content": prompt}],
+        "temperature": 0,
+        "max_tokens": 2000,
+    }
+
+    retries = 2
+    for attempt in range(retries + 1):
+        try:
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                if res.status_code == 200:
+                    return res.json()["choices"][0]["message"]["content"].strip()
+                logging.warning(f"Groq API failed: {res.status_code} - {res.text}")
+        except httpx.RequestError as e:
+            logging.warning(f"Groq retry {attempt + 1} failed: {e}")
+        await asyncio.sleep(1.5)
+    raise HTTPException(status_code=500, detail="Groq spell correction failed.")
+
+def vision_task(content: bytes) -> str:
     credentials_path = os.getenv("GOOGLE_APPLICATION_CREDENTIALS")
-
     if not credentials_path:
-        logging.error("Environment variable 'GOOGLE_APPLICATION_CREDENTIALS' is not set.")
-        raise HTTPException(status_code=500, detail="Google credentials are not set.")
-
-    # If file doesn't exist (Render), treat it as embedded JSON instead of file path
+        raise HTTPException(status_code=500, detail="Google credentials not set.")
     if not os.path.exists(credentials_path):
-        logging.info("GOOGLE_APPLICATION_CREDENTIALS looks like JSON. Trying to interpret as embedded credentials.")
-
         try:
             creds_data = json.loads(credentials_path)
             with tempfile.NamedTemporaryFile(mode="w", delete=False, suffix=".json") as temp:
                 json.dump(creds_data, temp)
                 os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = temp.name
-                logging.info("Temp credential file created from inline JSON.")
-        except Exception as e:
-            logging.exception("Failed to handle GOOGLE_APPLICATION_CREDENTIALS as embedded JSON.")
-            raise HTTPException(status_code=500, detail="Invalid credential format in environment variable.")
+        except Exception:
+            raise HTTPException(status_code=500, detail="Invalid Google credentials format.")
     else:
-        logging.info(f"Using credential file: {credentials_path}")
+        os.environ["GOOGLE_APPLICATION_CREDENTIALS"] = credentials_path
 
-    # Initialize Vision API client
-    try:
-        client = vision.ImageAnnotatorClient()
-        logging.info("Vision API client initialized successfully.")
-    except Exception as e:
-        logging.exception("Failed to initialize Vision API client.")
-        raise HTTPException(status_code=500, detail="Failed to initialize Vision API client.")
-
-    # Read image content
-    try:
-        content = image_file.read()
-        content = preprocess_image(content)
-        logging.debug(f"Read {len(content)} bytes from image.")
-    except Exception as e:
-        logging.exception("Failed to read the image file.")
-        raise HTTPException(status_code=400, detail="Failed to read the image.")
-
+    client = vision.ImageAnnotatorClient()
     image = vision.Image(content=content)
-
-    # Send image to Vision API for text detection
-    try:
-        logging.info("Sending image to Vision API for text detection.")
-        response = client.text_detection(image=image)
-    except Exception as e:
-        logging.exception("Vision API request failed.")
-        raise HTTPException(status_code=500, detail="Vision API request failed.")
-
-    # Handle response
+    response = client.document_text_detection(image=image)
     if response.error.message:
-        logging.error(f"Vision API returned an error: {response.error.message}")
-        raise HTTPException(status_code=500, detail="Vision API returned an error.")
-
+        raise HTTPException(status_code=500, detail="Vision API error.")
     texts = response.text_annotations
+    return texts[0].description if texts else ""
 
-    if texts:
-        logging.info("Text detected successfully.")
-        return texts[0].description
+async def extract_text_from_image_or_pdf(file: UploadFile) -> str:
+    filename = file.filename.lower()
+    content = await file.read()
+
+    image_bytes_list = []
+    if filename.endswith(".pdf"):
+        try:
+            images = convert_from_bytes(content, fmt="png")
+            for img in images:
+                buf = io.BytesIO()
+                img.save(buf, format="PNG")
+                image_bytes_list.append(buf.getvalue())
+        except Exception as e:
+            logging.error(f"PDF to image conversion failed: {e}")
+            raise HTTPException(status_code=400, detail="Invalid or unreadable PDF file.")
     else:
-        logging.warning("No text was found in the image.")
-        return "No text found."
-#Health Check
-@app.get("/health")
-async def health_check():
-    return {"status": "ok"}
+        image_bytes_list = [content]
 
-# ----------------------------
-# FastAPI Route for OCR
-# ----------------------------
+    full_raw_text = ""
+    for img_bytes in image_bytes_list:
+        processed = preprocess_image(img_bytes)
+        try:
+            ocr_text = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(executor, vision_task, processed),
+                timeout=20.0,
+            )
+            full_raw_text += ocr_text + "\n"
+        except asyncio.TimeoutError:
+            logging.warning("OCR timeout on one page.")
+            continue
+
+    if not full_raw_text.strip():
+        raise HTTPException(status_code=422, detail="No text found in input.")
+
+    corrected_text = await groq_spellcheck(full_raw_text)
+    return corrected_text
+
 @app.post("/getTextFromImage/")
 async def extract_text(file: UploadFile = File(...)):
     try:
-        result = extract_text_from_image(file.file)
-        return {"extracted_text": result}
+        corrected_text = await extract_text_from_image_or_pdf(file)
+        return {"extracted_text": corrected_text}
     except HTTPException as e:
         raise e
-    except Exception as e:
+    except Exception:
         logging.exception("Unexpected error.")
-        raise HTTPException(status_code=500, detail="An unexpected error occurred.")
+        raise HTTPException(status_code=500, detail="Internal server error")
 
-# ----------------------------
-# Run the FastAPI app
-# ----------------------------
-# To run this app, use the following:
-# uvicorn main:app --reload
+@app.get("/health")
+async def health_check():
+    return {"status": "ok"}
