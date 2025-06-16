@@ -79,19 +79,24 @@ def preprocess_image(img_bytes: bytes) -> bytes:
         return img_bytes
 
 import re
-
 async def groq_spellcheck(raw_text: str) -> str:
     prompt = f"""
 You are a spelling correction assistant for handwritten student answer sheets.
 
-Your job is:
-1. Correct only spelling mistakes.
-2. Do NOT change grammar, phrasing, punctuation, or sentence structure.
-3. If you see answer labels like 'Ans 1', 'Ans 2', 'Ams 3', 'Ans-5' or similar:
-   - Convert them into the standard format: 'Ans1', 'Ans2', 'Ans3' (no space after 'Ans').
-   - Ensure each answer begins on a new line with 'Ans<number>' followed by 1–2 spaces before the actual content.
+Your task is:
+1. Correct **only** spelling mistakes.
+2. Do NOT change grammar, sentence structure, punctuation, or phrasing.
+3. If you see answer labels like 'Ans 1', 'Ams 2', 'Ans-3' etc., normalize them to the format: 'Ans1', 'Ans2', 'Ans3' — without space after 'Ans'.
+4. Each answer must begin on a **new line** with the label 'Ans<number>' followed by 1–2 spaces before the content.
 
-Only return the corrected answers as plain text — no explanation or headings.
+Important instructions:
+- Answers may appear in any order (e.g., Ans1, Ans5, Ans3), and that is expected.
+- Sometimes students write answers across multiple pages. You may receive **only one part** of such an answer.
+- Do NOT assume or mention that an answer is missing, incomplete, or part of another answer.
+- Do NOT create or insert any missing answer labels like 'Ans2' unless it is clearly present in the text.
+- NEVER explain your assumptions or include commentary in your output.
+
+Return only the corrected answer sheet text — plain text only.
 
 Text:
 \"\"\"{raw_text}\"\"\"
@@ -119,16 +124,16 @@ Text:
                 if res.status_code == 200:
                     result = res.json()["choices"][0]["message"]["content"].strip()
 
-                    # Remove unwanted prefaces
+                    # Clean extra prefaces
                     lower = result.lower()
                     if lower.startswith("here is") or lower.startswith("corrected text"):
                         parts = result.split("\n", 1)
                         if len(parts) > 1:
                             result = parts[1].strip()
 
-                    # Apply regex-based post-processing for safety
+                    # Regex post-processing to normalize any missed labels
                     result = re.sub(r'\b(A[nm]s)[\s\-]*(\d+)', r'Ans\2', result)
-                    result = re.sub(r'(Ans\d+)(\S)', r'\1 \2', result)  # Ensure space after AnsN
+                    result = re.sub(r'(Ans\d+)(\S)', r'\1 \2', result)
 
                     logging.info(f"Groq API success. Corrected text (truncated): {result[:250]}...")
                     return result
