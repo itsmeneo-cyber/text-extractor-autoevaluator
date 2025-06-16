@@ -1,3 +1,4 @@
+# [All your imports stay the same]
 import logging
 import os
 import io
@@ -13,6 +14,7 @@ from pdf2image import convert_from_bytes
 import httpx
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
+import re
 
 # Load environment variables
 load_dotenv()
@@ -78,7 +80,7 @@ def preprocess_image(img_bytes: bytes) -> bytes:
         logging.warning("Preprocessing failed, using original image.")
         return img_bytes
 
-import re
+
 async def groq_spellcheck(raw_text: str) -> str:
     prompt = f"""
 You are a spelling correction assistant for handwritten student answer sheets.
@@ -124,14 +126,14 @@ Text:
                 if res.status_code == 200:
                     result = res.json()["choices"][0]["message"]["content"].strip()
 
-                    # Clean extra prefaces
+                    # Post-cleaning
                     lower = result.lower()
                     if lower.startswith("here is") or lower.startswith("corrected text"):
                         parts = result.split("\n", 1)
                         if len(parts) > 1:
                             result = parts[1].strip()
 
-                    # Regex post-processing to normalize any missed labels
+                    # Normalize labels
                     result = re.sub(r'\b(A[nm]s)[\s\-]*(\d+)', r'Ans\2', result)
                     result = re.sub(r'(Ans\d+)(\S)', r'\1 \2', result)
 
@@ -144,6 +146,7 @@ Text:
         await asyncio.sleep(1.5)
 
     raise HTTPException(status_code=500, detail="Groq spell correction failed.")
+
 
 def vision_task(content: bytes) -> str:
     setup_google_credentials()
@@ -180,7 +183,8 @@ async def extract_text_from_image_or_pdf(file: UploadFile) -> str:
         logging.info("File is an image.")
         image_bytes_list = [content]
 
-    full_raw_text = ""
+    final_corrected_text = ""
+
     for idx, img_bytes in enumerate(image_bytes_list):
         processed = preprocess_image(img_bytes)
         try:
@@ -189,15 +193,20 @@ async def extract_text_from_image_or_pdf(file: UploadFile) -> str:
                 timeout=20.0,
             )
             logging.info(f"OCR text from image {idx + 1} received.")
-            full_raw_text += ocr_text + "\n"
+
+            corrected = await groq_spellcheck(ocr_text)
+            logging.info(f"Groq correction for image {idx + 1} done.")
+            final_corrected_text += corrected.strip() + "\n\n"
+
         except asyncio.TimeoutError:
             logging.warning(f"OCR timeout on image {idx + 1}. Skipping.")
+        except Exception as e:
+            logging.warning(f"Skipping image {idx + 1} due to error: {e}")
 
-    if not full_raw_text.strip():
-        raise HTTPException(status_code=422, detail="No text found in input.")
+    if not final_corrected_text.strip():
+        raise HTTPException(status_code=422, detail="No usable text found.")
 
-    corrected_text = await groq_spellcheck(full_raw_text)
-    return corrected_text
+    return final_corrected_text.strip()
 
 
 @app.post("/getTextFromImage/")
