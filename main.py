@@ -210,11 +210,8 @@ async def extract_text(files: List[UploadFile] = File(...)):
         raise HTTPException(status_code=500, detail="Internal server error")
 
 
-@app.get("/health")
+
+
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health_check():
-    return {"status": "ok"}
-
-
-@app.get("/")
-async def root():
-    return {"message": "Text Extractor Service is running"}
+    return {"status": "ok", "message": "Server is running"}
