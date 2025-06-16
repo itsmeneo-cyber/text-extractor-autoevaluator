@@ -78,16 +78,18 @@ def preprocess_image(img_bytes: bytes) -> bytes:
         logging.warning("Preprocessing failed, using original image.")
         return img_bytes
 
-
 async def groq_spellcheck(raw_text: str) -> str:
     prompt = f"""
 You are a spelling correction assistant.
 
-Please only correct spelling mistakes in the following text. Do NOT change any grammar, phrasing, or meaning. Return the corrected text only.
+Correct only the spelling mistakes in the text below. Do not change any grammar, punctuation, formatting, or phrasing.
+
+Return only the corrected text as plain output — no explanations, no headings, no markdown, and no prefix like "Here is...".
 
 Text:
 \"\"\"{raw_text}\"\"\"
 """
+
     headers = {
         "Authorization": f"Bearer {GROQ_API_KEY}",
         "Content-Type": "application/json",
@@ -102,11 +104,24 @@ Text:
     for attempt in range(3):
         try:
             async with httpx.AsyncClient(timeout=30.0) as client:
-                res = await client.post("https://api.groq.com/openai/v1/chat/completions", headers=headers, json=payload)
+                res = await client.post(
+                    "https://api.groq.com/openai/v1/chat/completions",
+                    headers=headers,
+                    json=payload
+                )
                 if res.status_code == 200:
                     result = res.json()["choices"][0]["message"]["content"].strip()
+
+                    # Optional post-processing: strip unwanted intro
+                    lower = result.lower()
+                    if lower.startswith("here is") or lower.startswith("corrected text"):
+                        parts = result.split("\n", 1)
+                        if len(parts) > 1:
+                            result = parts[1].strip()
+
                     logging.info(f"Groq API success. Corrected text (truncated): {result[:250]}...")
                     return result
+
                 logging.warning(f"Groq API failed (status {res.status_code}): {res.text}")
         except httpx.RequestError as e:
             logging.warning(f"Groq API request error (attempt {attempt + 1}): {e}")
