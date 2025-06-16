@@ -78,13 +78,20 @@ def preprocess_image(img_bytes: bytes) -> bytes:
         logging.warning("Preprocessing failed, using original image.")
         return img_bytes
 
+import re
+
 async def groq_spellcheck(raw_text: str) -> str:
     prompt = f"""
-You are a spelling correction assistant.
+You are a spelling correction assistant for handwritten student answer sheets.
 
-Correct only the spelling mistakes in the text below. Do not change any grammar, punctuation, formatting, or phrasing.
+Your job is:
+1. Correct only spelling mistakes.
+2. Do NOT change grammar, phrasing, punctuation, or sentence structure.
+3. If you see answer labels like 'Ans 1', 'Ans 2', 'Ams 3', 'Ans-5' or similar:
+   - Convert them into the standard format: 'Ans1', 'Ans2', 'Ans3' (no space after 'Ans').
+   - Ensure each answer begins on a new line with 'Ans<number>' followed by 1–2 spaces before the actual content.
 
-Return only the corrected text as plain output — no explanations, no headings, no markdown, and no prefix like "Here is...".
+Only return the corrected answers as plain text — no explanation or headings.
 
 Text:
 \"\"\"{raw_text}\"\"\"
@@ -112,12 +119,16 @@ Text:
                 if res.status_code == 200:
                     result = res.json()["choices"][0]["message"]["content"].strip()
 
-                    # Optional post-processing: strip unwanted intro
+                    # Remove unwanted prefaces
                     lower = result.lower()
                     if lower.startswith("here is") or lower.startswith("corrected text"):
                         parts = result.split("\n", 1)
                         if len(parts) > 1:
                             result = parts[1].strip()
+
+                    # Apply regex-based post-processing for safety
+                    result = re.sub(r'\b(A[nm]s)[\s\-]*(\d+)', r'Ans\2', result)
+                    result = re.sub(r'(Ans\d+)(\S)', r'\1 \2', result)  # Ensure space after AnsN
 
                     logging.info(f"Groq API success. Corrected text (truncated): {result[:250]}...")
                     return result
@@ -128,7 +139,6 @@ Text:
         await asyncio.sleep(1.5)
 
     raise HTTPException(status_code=500, detail="Groq spell correction failed.")
-
 
 def vision_task(content: bytes) -> str:
     setup_google_credentials()
