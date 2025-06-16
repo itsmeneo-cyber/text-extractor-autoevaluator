@@ -1,4 +1,3 @@
-# [All your imports stay the same]
 import logging
 import os
 import io
@@ -10,11 +9,11 @@ from PIL import Image, ImageEnhance
 from google.cloud import vision
 from fastapi import FastAPI, HTTPException, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from pdf2image import convert_from_bytes
 import httpx
 import asyncio
 from concurrent.futures import ThreadPoolExecutor
 import re
+from typing import List
 
 # Load environment variables
 load_dotenv()
@@ -85,20 +84,25 @@ async def groq_spellcheck(raw_text: str) -> str:
     prompt = f"""
 You are a spelling correction assistant for handwritten student answer sheets.
 
-Your task is:
-1. Correct **only** spelling mistakes.
-2. Do NOT change grammar, sentence structure, punctuation, or phrasing.
-3. If you see answer labels like 'Ans 1', 'Ams 2', 'Ans-3' etc., normalize them to the format: 'Ans1', 'Ans2', 'Ans3' — without space after 'Ans'.
-4. Each answer must begin on a **new line** with the label 'Ans<number>' followed by 1–2 spaces before the content.
+### TASK
+Correct **only** spelling mistakes in the given answer sheet text.
 
-Important instructions:
-- Answers may appear in any order (e.g., Ans1, Ans5, Ans3), and that is expected.
-- Sometimes students write answers across multiple pages. You may receive **only one part** of such an answer.
-- Do NOT assume or mention that an answer is missing, incomplete, or part of another answer.
-- Do NOT create or insert any missing answer labels like 'Ans2' unless it is clearly present in the text.
-- NEVER explain your assumptions or include commentary in your output.
+### RULES
+1. **Do NOT change** grammar, sentence structure, punctuation, or phrasing.
+2. Normalize answer labels like 'Ans 1', 'Ams 2', 'Ans-3', or 'Ans 10' to the format: **'Ans1', 'Ans2', ..., 'Ans10'** (no space after 'Ans').
+3. Each answer must **start on a new line** with its label: `Ans1`, `Ans2`, ..., `Ans10` followed by 1–2 spaces before the answer content.
+4. **Preserve the original order** of answers and text. Do not reorder or restructure content.
+5. Do **not insert** missing answer labels unless they are clearly present (even partially).
+6. Do **not assume** or explain anything. If text is unclear or partial, leave it as is.
+7. Do not fix formatting unless it directly affects spelling or label recognition.
 
-Return only the corrected answer sheet text — plain text only.
+### CONTEXT
+- Students may write answers out of order (e.g., Ans5, Ans1, Ans10).
+- You might receive a partial scan (only one page) of a multi-page answer sheet.
+- Labels might be missing or misrecognized (e.g., just 'Ans' or 'Ans-' instead of 'Ans1').
+
+### OUTPUT FORMAT
+Return only the corrected answer sheet text in **plain text** — no explanations or formatting like bullet points or Markdown.
 
 Text:
 \"\"\"{raw_text}\"\"\"
@@ -163,61 +167,41 @@ def vision_task(content: bytes) -> str:
     return extracted
 
 
-async def extract_text_from_image_or_pdf(file: UploadFile) -> str:
-    filename = file.filename.lower()
-    content = await file.read()
-
-    image_bytes_list = []
-    if filename.endswith(".pdf"):
-        logging.info("File is a PDF. Converting pages to images...")
-        try:
-            images = convert_from_bytes(content, fmt="png")
-            for img in images:
-                buf = io.BytesIO()
-                img.save(buf, format="PNG")
-                image_bytes_list.append(buf.getvalue())
-        except Exception as e:
-            logging.error(f"PDF conversion failed: {e}")
-            raise HTTPException(status_code=400, detail="Invalid or unreadable PDF file.")
-    else:
-        logging.info("File is an image.")
-        image_bytes_list = [content]
-
-    final_corrected_text = ""
-
-    for idx, img_bytes in enumerate(image_bytes_list):
-        processed = preprocess_image(img_bytes)
-        try:
-            ocr_text = await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(executor, vision_task, processed),
-                timeout=20.0,
-            )
-            logging.info(f"OCR text from image {idx + 1} received.")
-
-            corrected = await groq_spellcheck(ocr_text)
-            logging.info(f"Groq correction for image {idx + 1} done.")
-            final_corrected_text += corrected.strip() + "\n\n"
-
-        except asyncio.TimeoutError:
-            logging.warning(f"OCR timeout on image {idx + 1}. Skipping.")
-        except Exception as e:
-            logging.warning(f"Skipping image {idx + 1} due to error: {e}")
-
-    if not final_corrected_text.strip():
-        raise HTTPException(status_code=422, detail="No usable text found.")
-
-    return final_corrected_text.strip()
-
-
 @app.post("/getTextFromImage/")
-async def extract_text(file: UploadFile = File(...)):
+async def extract_text(files: List[UploadFile] = File(...)):
     try:
-        logging.info(f"Received file: {file.filename} ({file.content_type})")
+        logging.info(f"Received {len(files)} file(s).")
         start_time = time.time()
-        corrected_text = await extract_text_from_image_or_pdf(file)
+
+        all_ocr_text = ""
+
+        for idx, file in enumerate(files):
+            logging.info(f"Processing file {idx + 1}: {file.filename} ({file.content_type})")
+            img_bytes = await file.read()
+            processed = preprocess_image(img_bytes)
+
+            try:
+                ocr_text = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(executor, vision_task, processed),
+                    timeout=20.0,
+                )
+                logging.info(f"OCR for image {idx + 1} complete. (Length: {len(ocr_text)} chars)")
+                all_ocr_text += ocr_text.strip() + "\n\n"
+
+            except asyncio.TimeoutError:
+                logging.warning(f"OCR timeout on image {idx + 1}. Skipping.")
+            except Exception as e:
+                logging.warning(f"OCR failed on image {idx + 1}: {e}")
+
+        if not all_ocr_text.strip():
+            raise HTTPException(status_code=422, detail="No usable text extracted from any image.")
+
+        corrected_text = await groq_spellcheck(all_ocr_text)
         elapsed = time.time() - start_time
-        logging.info(f"Text extraction and correction completed in {elapsed:.2f}s")
+        logging.info(f"Total processing (OCR + Groq) took {elapsed:.2f}s")
+
         return {"extracted_text": corrected_text}
+
     except HTTPException as e:
         logging.warning(f"Request failed with {e.status_code}: {e.detail}")
         raise e
